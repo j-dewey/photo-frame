@@ -15,12 +15,16 @@ pub const FAVORITES: &str = "favorites";
 pub fn scan(root: &Path) -> Vec<Photo> {
     let mut photos = Vec::new();
     for (dir, favorite) in [(IMAGES, false), (FAVORITES, true)] {
-        for entry in fs::read_dir(root.join(dir)).into_iter().flatten().flatten() {
+        let cur_dir = root.join(dir);
+        println!("[Scanner] Scanning dir {:?}", cur_dir);
+        for entry in fs::read_dir(cur_dir).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().to_lowercase();
             // Skip hidden files (macOS writes "._photo.jpg" junk) and non-JPEGs.
             if name.starts_with('.') || !(name.ends_with(".jpg") || name.ends_with(".jpeg")) {
+                println!("[Scanner] Skipping file {:?}", name);
                 continue;
             }
+            println!("[Scanner] Reading file {:?}", name);
             let path = entry.path();
             let (date, orientation) = read_exif(&path);
             photos.push(Photo {

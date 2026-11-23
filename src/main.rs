@@ -43,6 +43,7 @@ fn main() -> Res<()> {
 
     watch_buttons(&tx);
 
+    println!("Starting threads");
     let (index_tx, index_root) = (tx.clone(), root.clone());
     thread::spawn(move || {
         let _ = index_tx.send(Event::Index(indexer::scan(&index_root)));
