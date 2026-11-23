@@ -38,6 +38,7 @@ fn main() -> Res<()> {
     let (tx, rx) = mpsc::channel();
 
     watch_buttons(&tx);
+    println!("Reading from root: {:?}", root);
 
     let (index_tx, index_root) = (tx.clone(), root.clone());
     thread::spawn(move || {
