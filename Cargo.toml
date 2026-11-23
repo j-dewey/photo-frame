@@ -1,0 +1,19 @@
+[package]
+name = "slideshow"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# JPEG decoding, single-threaded (no rayon), with built-in downscaling.
+jpeg-decoder = { version = "0.3", default-features = false }
+# Reads the "date taken" and rotation out of each photo.
+kamadak-exif = "0.6"
+# An 8x8 bitmap font for the date caption.
+font8x8 = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

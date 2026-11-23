@@ -1,0 +1,11 @@
+[Unit]
+Description=Photo frame slideshow
+
+[Service]
+ExecStart=/usr/local/bin/slideshow /mnt/frame
+# The program exits when it finds no photos; restarting makes it rescan.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
