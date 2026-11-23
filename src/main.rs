@@ -33,12 +33,15 @@ pub enum Event {
 }
 
 fn main() -> Res<()> {
-    let root = PathBuf::from(std::env::args().nth(1).unwrap_or(DEFAULT_ROOT.into()));
+    println!("Initing slideshow...");
+    println!("Loading PathBuf at {DEFAULT_ROOT}");
+    let root = PathBuf::from(DEFAULT_ROOT);
+    println!("Loading Frame Buffer");
     let fb = fb::Fb::open()?;
+    println!("Loading channels");
     let (tx, rx) = mpsc::channel();
 
     watch_buttons(&tx);
-    println!("Reading from root: {:?}", root);
 
     let (index_tx, index_root) = (tx.clone(), root.clone());
     thread::spawn(move || {

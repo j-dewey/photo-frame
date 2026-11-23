@@ -8,8 +8,8 @@ use std::path::Path;
 
 use crate::common::Photo;
 
-pub const IMAGES: &str = "Images";
-pub const FAVORITES: &str = "Favorites";
+pub const IMAGES: &str = "photos";
+pub const FAVORITES: &str = "favorites";
 
 /// Every JPEG in Images/ and Favorites/, in a fresh random order.
 pub fn scan(root: &Path) -> Vec<Photo> {
