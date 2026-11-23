@@ -51,6 +51,7 @@ impl Fb {
             height: config.fb_size.1,
         };
         if let Err(e) = fb.connect() {
+            println!("[Fb] Unable to conenct to file {:?}", fb.fb_file);
             println!("[Fb] Running headless until a screen appears ({e})");
         }
         fb
