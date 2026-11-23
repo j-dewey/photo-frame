@@ -3,9 +3,15 @@
 //! Three kinds of thread, all of which sleep unless there is work to do:
 //!   - indexer:   scans the USB stick once at start-up, then exits
 //!   - input:     one per input device, blocked until a button is pressed
-//!   - presenter: the main thread, wakes once per slide or on an event
+//!   - presenter: the main thread, wakes once per slide or on a button press
+//!
+//! They share two things, each a Mutex + Condvar:
+//!   - FSMap:   the indexer adds photos as it finds them; the presenter shows
+//!              them, starting as soon as the first one is in
+//!   - Buttons: the input threads record a press; the presenter acts on it
 
 mod common;
+mod config;
 mod fb;
 mod indexer;
 mod presenter;
@@ -13,48 +19,47 @@ mod presenter;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread;
 
-pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
+use common::{Button, Buttons, FSMap};
 
-/// Where the USB stick is mounted, unless a path is given as the first argument.
-const DEFAULT_ROOT: &str = "/mnt/photos";
+pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 // Linux key codes. The buttons are set up in /boot/firmware/config.txt to act
 // as these keys, so a USB keyboard works too (handy for testing).
 const KEY_F: u16 = 33; // toggle favorite
 const KEY_M: u16 = 50; // next display mode
 
-pub enum Event {
-    Index(Vec<common::Photo>),
-    ToggleFavorite,
-    NextMode,
-}
-
 fn main() -> Res<()> {
     println!("Initing slideshow...");
-    println!("Loading PathBuf at {DEFAULT_ROOT}");
-    let root = PathBuf::from(DEFAULT_ROOT);
+    // photos.conf: the first argument, or /etc/photos.conf.
+    let config_path = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH));
+    let config = config::Config::load(&config_path);
+    let root = config.photos_root.clone();
+    println!("Loading PathBuf at {}", root.display());
     println!("Loading Frame Buffer");
-    let fb = fb::Fb::open()?;
-    println!("Loading channels");
-    let (tx, rx) = mpsc::channel();
-
-    watch_buttons(&tx);
+    let fb = fb::Fb::open(&config);
+    let map = Arc::new(FSMap::new(&root));
+    let buttons = Arc::new(Buttons::default());
 
     println!("Starting threads");
-    let (index_tx, index_root) = (tx.clone(), root.clone());
+    watch_buttons(&buttons);
+
+    let index_map = Arc::clone(&map);
     thread::spawn(move || {
-        let _ = index_tx.send(Event::Index(indexer::scan(&index_root)));
+        indexer::scan(&root, &index_map);
+        index_map.finish_indexing();
     });
 
-    // `tx` stays alive here so the presenter's channel never disconnects.
-    presenter::run(fb, rx, &root)
+    presenter::run(fb, map, buttons)
 }
 
 /// Start one blocked reader thread per /dev/input/event* device.
-fn watch_buttons(tx: &Sender<Event>) {
+fn watch_buttons(buttons: &Arc<Buttons>) {
     for entry in std::fs::read_dir("/dev/input")
         .into_iter()
         .flatten()
@@ -63,7 +68,7 @@ fn watch_buttons(tx: &Sender<Event>) {
         if !entry.file_name().to_string_lossy().starts_with("event") {
             continue;
         }
-        let tx = tx.clone();
+        let buttons = Arc::clone(buttons);
         thread::spawn(move || {
             let Ok(mut dev) = File::open(entry.path()) else {
                 return;
@@ -80,11 +85,11 @@ fn watch_buttons(tx: &Sender<Event>) {
                 if kind != 1 || value != 1 {
                     continue; // only key-down events
                 }
-                let _ = match code {
-                    KEY_F => tx.send(Event::ToggleFavorite),
-                    KEY_M => tx.send(Event::NextMode),
-                    _ => Ok(()),
-                };
+                match code {
+                    KEY_F => buttons.press(Button::Favorite),
+                    KEY_M => buttons.press(Button::Mode),
+                    _ => {}
+                }
             }
         });
     }

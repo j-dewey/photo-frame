@@ -1,5 +1,12 @@
 # Slideshow
 
+## Build on Mac ARM
+`DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --release --target arm-unknown-linux-gnueabihf`
+
+This causes it to build it for Linux rather than Mac
+
+## Overview
+
 A photo frame program for a Raspberry Pi. It shows the JPEGs on a USB stick
 one at a time, with the date each was taken in the bottom-left corner.
 
@@ -17,8 +24,9 @@ on a real Pi, so expect to spend a little time on first boot.
 
 | File               | Job                                                            |
 | ------------------ | -------------------------------------------------------------- |
-| `src/main.rs`      | Starts everything; turns button presses into events            |
-| `src/indexer.rs`   | Runs once at start: lists the photos, reads date and rotation  |
+| `src/main.rs`      | Starts everything; records button presses                      |
+| `src/common.rs`    | `FSMap` (photos by season and favorite) and `Buttons`, shared between threads |
+| `src/indexer.rs`   | Runs once at start: adds each photo to the `FSMap` as it reads it |
 | `src/presenter.rs` | Runs forever: decodes, scales, captions and shows each photo   |
 | `src/fb.rs`        | Writes pixels to `/dev/fb0`                                    |
 
@@ -27,10 +35,72 @@ Things to know:
 - **JPEG only.** `.jpg` / `.jpeg`. iPhone HEIC photos must be exported as JPEG
   first. Other files are ignored.
 - Photos play in a random order that changes every boot.
+- The slideshow starts as soon as the first photo has been read, while the
+  rest of the stick is still being scanned.
+- The stick is read once at start-up. Photos that can't be read are logged
+  and skipped; the slideshow carries on with the rest.
 - Seasons go by month (Mar-May, Jun-Aug, Sep-Nov, Dec-Feb). Photos with no
   "date taken" appear only in All Photos and Favorites, with no caption.
 - Only the top level of `Images/` and `Favorites/` is read, not subfolders.
 - The slide time is `SLIDE` at the top of `src/presenter.rs`.
+
+## Testing without a screen
+
+Settings live in `photos.conf`: `/etc/photos.conf` on the Pi, or any file
+passed as the program's first argument. The example `photos.conf` in this
+folder explains each one:
+
+| Setting       | Default        | What it does                                              |
+| ------------- | -------------- | --------------------------------------------------------- |
+| `photos_root` | `/mnt/photos`  | Folder holding `photos/` and `favorites/`                 |
+| `fb_file`     | (none)         | Write each frame to this file while `/dev/fb0` is missing |
+| `fb_size`     | `1920x1080`    | Size of the frames written to `fb_file`                   |
+
+If `/dev/fb0` appears later (a screen is plugged in), the program switches to
+it at the next slide and stops writing the file. A missing `photos.conf`
+means all defaults; a bad line is logged and skipped.
+
+This lets the program run anywhere, including a Mac. Frames are written as
+raw 32-bit BGRA pixels, and `tools/fb2png.py` (standard Python only) turns
+the latest one into a PNG:
+
+```
+cargo build
+printf 'photos_root = %s\nfb_file = /tmp/fb.raw\nfb_size = 800x480\n' ~/test-stick > test.conf
+./target/debug/slideshow test.conf
+# in another terminal, whenever you want to look:
+python3 tools/fb2png.py /tmp/fb.raw screen.png 800x480
+```
+
+The buttons read `/dev/input`, so they only work on Linux (a USB keyboard's
+F and M keys). On a Mac you can check the slideshow, captions and messages,
+but not the buttons.
+
+### Watching the Pi's screen from your computer
+
+`tools/pi-screen.py` shows the Pi's screen live in a browser tab, as if a
+monitor were plugged in. It copies the framebuffer over SSH every 2 seconds;
+nothing needs installing on the Pi.
+
+```
+python3 tools/pi-screen.py <user>@<name>.local
+```
+
+With a monitor (or HDMI forced on, step 3) it reads `/dev/fb0`. With no
+screen at all, the program writes frames to `fb_file` instead
+(`/dev/shm/fb.raw` in the example `photos.conf`), so point the viewer there:
+
+```
+python3 tools/pi-screen.py <user>@<name>.local --device /dev/shm/fb.raw --size 1920x1080
+```
+
+Keep `fb_file` somewhere in RAM like `/dev/shm`: the whole file is rewritten
+every slide, which would wear out the SD card.
+
+`--interval` changes how often it refreshes. Each refresh copies a whole
+screen (about 8 MB at 1920x1080), so keep it at a few seconds over Wi-Fi.
+It only shows the screen; press the buttons (or F and M on a keyboard
+plugged into the Pi) to drive it.
 
 ## The USB stick
 
@@ -92,6 +162,17 @@ change `console=tty1` to `console=tty3` and add to the end:
 quiet logo.nologo vt.global_cursor_default=0
 ```
 
+Also add this, with your screen's resolution, so the Pi always sets up the
+screen (`/dev/fb0`), even if it is switched off or unplugged at boot:
+
+```
+video=HDMI-A-1:1920x1080M@60D
+```
+
+The `D` at the end forces the HDMI output on. Without it the program still
+runs, but draws nothing until a screen is found; it checks again at every
+slide.
+
 Then turn off the login prompt on the screen:
 
 ```
@@ -101,13 +182,13 @@ sudo systemctl disable getty@tty1
 ### 4. Mount the USB stick
 
 ```
-sudo mkdir /mnt/frame
+sudo mkdir /mnt/photos
 ```
 
 Add this line to `/etc/fstab`:
 
 ```
-LABEL=FRAME  /mnt/frame  auto  noauto,nofail,x-systemd.automount,x-systemd.device-timeout=5,noatime  0  0
+LABEL=FRAME  /mnt/photos  auto  noauto,nofail,x-systemd.automount,x-systemd.device-timeout=5,noatime  0  0
 ```
 
 The stick is mounted when the program first looks at it, and the Pi still
@@ -129,6 +210,7 @@ Copy this `slideshow/` folder to the Pi (for example
 cd slideshow
 cargo build --release
 sudo cp target/release/slideshow /usr/local/bin/
+sudo cp photos.conf /etc/photos.conf
 sudo cp slideshow.service /etc/systemd/system/
 sudo systemctl enable --now slideshow
 ```
@@ -167,12 +249,17 @@ access. A longer `SLIDE` time means fewer wake-ups.
 ## If something is wrong
 
 - **"No photos found"**: the stick is not named `FRAME`, has no `Images/`
-  folder, or holds no JPEGs. The program retries every few seconds.
-- **Blank screen, service keeps restarting**: check `ls /dev/fb0` exists and
-  read `journalctl -u slideshow -e`.
+  folder, or holds no JPEGs. The stick is only read at start-up, so fix it,
+  then unplug the frame and plug it back in.
+- **A photo never shows up**: it couldn't be read and was skipped.
+  `journalctl -u slideshow -e` lists each skipped file.
+- **Blank screen**: check `ls /dev/fb0` exists. If it doesn't, the screen
+  wasn't detected; add the `video=...D` setting from step 3.
+  `journalctl -u slideshow -e` says "running headless" while there is no
+  screen, and "Found /dev/fb0" once there is.
 - **Stray text or a cursor over the photo**: recheck step 3.
-- **Colours look banded**: the framebuffer is probably in 16-bit mode. Adding
-  `video=HDMI-A-1:1920x1080M-32@60` (with your screen's resolution) to
-  `cmdline.txt` asks for 32-bit.
+- **Colours look banded**: the framebuffer is probably in 16-bit mode. Change
+  the `video=` setting in `cmdline.txt` to `video=HDMI-A-1:1920x1080M-32@60D`
+  (with your screen's resolution) to ask for 32-bit.
 - **A button does nothing**: check the wiring goes to ground, then run
   `sudo apt install evtest && sudo evtest` to see if presses arrive.

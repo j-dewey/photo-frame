@@ -2,8 +2,9 @@
 Description=Photo frame slideshow
 
 [Service]
-ExecStart=/usr/local/bin/slideshow /mnt/frame
-# The program exits when it finds no photos; restarting makes it rescan.
+ExecStart=/usr/local/bin/slideshow
+# Settings are in /etc/photos.conf.
+# Only needed if the program crashes (e.g. no framebuffer yet at boot).
 Restart=always
 RestartSec=5
 

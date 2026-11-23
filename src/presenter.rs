@@ -1,16 +1,13 @@
 //! Shows one photo at a time and reacts to the two buttons.
 
-use crate::common::{Mode, Photo, MONTHS};
+use crate::common::{Button, Buttons, FSMap, Mode, Photo, MONTHS};
 use crate::fb::Fb;
-use crate::indexer::{FAVORITES, IMAGES};
-use crate::{Event, Res};
+use crate::indexer::read_exif;
+use crate::Res;
 use jpeg_decoder::{Decoder, PixelFormat};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::BufReader;
-use std::path::Path;
-use std::process::Command;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::thread::sleep;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long each photo stays up. Longer = less work = less power.
@@ -18,129 +15,138 @@ const SLIDE: Duration = Duration::from_secs(30);
 /// Ignore button presses closer together than this (switch bounce).
 const DEBOUNCE: Duration = Duration::from_millis(250);
 
-struct Presenter<'a> {
+struct Presenter {
     fb: Fb,
-    root: &'a Path,
-    photos: Vec<Photo>,
-    /// Index into `photos` of the slide on screen (or the last one shown).
+    /// Shared with the indexer, which may still be adding photos.
+    map: Arc<FSMap>,
+    /// Index into `map` of the slide on screen (or the last one shown).
     pos: usize,
-    /// False when the current mode has nothing to show.
-    showing: bool,
+    /// The photo on screen, or None when the current mode has nothing to show.
+    current: Option<Photo>,
     mode: Mode,
     /// The current photo, scaled to the screen, without any text on it.
     canvas: Vec<u8>,
 }
 
-pub fn run(fb: Fb, events: Receiver<Event>, root: &Path) -> Res<()> {
+pub fn run(fb: Fb, map: Arc<FSMap>, buttons: Arc<Buttons>) -> Res<()> {
     let canvas = vec![0; fb.width * fb.height * 3];
     let mut p = Presenter {
         fb,
-        root,
-        photos: Vec::new(),
+        map,
         pos: 0,
-        showing: false,
+        current: None,
         mode: Mode::All,
         canvas,
     };
     p.draw(Some("Loading photos..."))?;
 
-    let mut indexed = false;
+    // Start as soon as the indexer has found one photo (or found none).
+    p.map.wait_for_photos();
+    buttons.clear(); // presses during loading are ignored
+    p.advance(false)?;
+
     let mut last_press = Instant::now();
     loop {
-        // Sleeps here until the slide is over or something happens.
-        match events.recv_timeout(SLIDE) {
-            Ok(Event::Index(photos)) => {
-                p.photos = photos;
-                indexed = true;
-                p.advance(false)?;
-            }
-            Ok(_) if !indexed || last_press.elapsed() < DEBOUNCE => {}
-            Ok(Event::ToggleFavorite) => {
+        // Sleeps here until the slide is over or a button is pressed.
+        match buttons.wait(SLIDE) {
+            None => p.advance(false)?,
+            Some(_) if last_press.elapsed() < DEBOUNCE => {}
+            Some(Button::Favorite) => {
                 last_press = Instant::now();
                 p.toggle_favorite()?;
             }
-            Ok(Event::NextMode) => {
+            Some(Button::Mode) => {
                 last_press = Instant::now();
                 p.mode = p.mode.next();
                 p.advance(true)?;
             }
-            Err(RecvTimeoutError::Timeout) if indexed => p.advance(false)?,
-            Err(_) => {}
         }
     }
 }
 
-impl Presenter<'_> {
-    /// Move to the next photo that belongs to the current mode.
+impl Presenter {
+    /// Move to the next photo that belongs to the current mode, skipping
+    /// (and logging) any that can't be read.
     fn advance(&mut self, announce_mode: bool) -> Res<()> {
-        loop {
-            let n = self.photos.len();
-            let next = (1..=n)
-                .map(|step| (self.pos + step) % n)
-                .find(|&i| self.mode.includes(&self.photos[i]));
+        let mut next = self.map.get_next_index(self.pos, self.mode);
+        for _ in 0..self.map.count(self.mode) {
             let Some(i) = next else { break };
             self.pos = i;
-            match render(&self.photos[i], self.fb.width, self.fb.height) {
+            let photo = self.load(i);
+            match render(&photo, self.fb.width, self.fb.height) {
                 Ok(canvas) => {
                     self.canvas = canvas;
-                    self.showing = true;
+                    self.current = Some(photo);
                     return self.draw(announce_mode.then_some(self.mode.name()));
                 }
-                // Unreadable file (or the stick was pulled out): forget it.
-                Err(_) => {
-                    self.photos.swap_remove(i);
-                }
+                Err(e) => eprintln!("[Presenter] Skipping {:?}: {e}", photo.path),
             }
+            next = self.map.get_next_index(i, self.mode);
         }
 
+        // Nothing in this mode could be shown. Keep running: the next slide
+        // or a mode change tries again.
         self.canvas.fill(0);
-        self.showing = false;
-        if self.photos.is_empty() {
-            // Nothing usable on the stick. Say so, then quit: systemd
-            // restarts us, which rescans, so a new stick gets picked up.
-            self.draw(Some("No photos found - check the USB stick"))?;
-            sleep(Duration::from_secs(10));
-            return Err("no photos".into());
+        self.current = None;
+        let message = if !self.map.is_indexed() {
+            format!("{}: loading photos...", self.mode.name())
+        } else if self.map.is_empty() {
+            "No photos found - check the USB stick".to_string()
+        } else {
+            format!("{}: no photos", self.mode.name())
+        };
+        self.draw(Some(&message))
+    }
+
+    /// Everything needed to show photo `i`.
+    fn load(&self, i: usize) -> Photo {
+        let path = self.map.get_photo(i).unwrap_or_default();
+        let (date, orientation) = read_exif(&path);
+        Photo {
+            path,
+            date,
+            orientation,
+            favorite: self.map.is_favorite(i),
         }
-        self.draw(Some(&format!("{}: no photos", self.mode.name())))
     }
 
     /// Move the current photo between Images/ and Favorites/ on the stick.
     fn toggle_favorite(&mut self) -> Res<()> {
-        if !self.showing {
+        if self.current.is_none() {
             return Ok(());
         }
-        let photo = &mut self.photos[self.pos];
-        let folder = self
-            .root
-            .join(if photo.favorite { IMAGES } else { FAVORITES });
-        let Some(name) = photo.path.file_name() else {
-            return Ok(());
-        };
-        let dest = folder.join(name);
-        // Never overwrite a different photo that happens to share the name.
-        if dest.exists() {
-            return Ok(());
-        }
-        let _ = fs::create_dir_all(&folder);
-        if fs::rename(&photo.path, &dest).is_ok() {
-            photo.path = dest;
-            photo.favorite = !photo.favorite;
-            // Flush to the stick now so pulling the plug can't lose the move.
-            let _ = Command::new("sync").status();
+        let favorite = self.map.toggle_favorite(self.pos);
+        if let (Some(photo), Some(path)) = (&mut self.current, self.map.get_photo(self.pos)) {
+            photo.favorite = favorite;
+            photo.path = path;
         }
         self.draw(None)
     }
 
+    /// Re-render the current photo (or a blank screen) at the screen's size.
+    fn resize_canvas(&mut self) {
+        let (w, h) = (self.fb.width, self.fb.height);
+        self.canvas = match &self.current {
+            Some(photo) => render(photo, w, h).unwrap_or_else(|e| {
+                eprintln!("[Presenter] Can't redraw {:?}: {e}", photo.path);
+                vec![0; w * h * 3]
+            }),
+            None => vec![0; w * h * 3],
+        };
+    }
+
     /// Photo + date caption (bottom left) + optional message (top left).
     fn draw(&mut self, message: Option<&str>) -> Res<()> {
+        if self.fb.reconnect() {
+            // A screen appeared at a different size: redo the photo for it.
+            self.resize_canvas();
+        }
         let (w, h) = (self.fb.width, self.fb.height);
         let scale = (h / 200).max(2);
         let margin = scale * 4;
         let mut frame = self.canvas.clone();
 
-        if self.showing {
-            let photo = &self.photos[self.pos];
+        if let Some(photo) = &self.current {
             let mut caption = match photo.date {
                 Some((y, m, d)) => format!("{} {}, {}", MONTHS[m as usize - 1], d, y),
                 None => String::new(),
