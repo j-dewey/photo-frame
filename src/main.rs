@@ -19,7 +19,7 @@ use std::thread;
 pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// Where the USB stick is mounted, unless a path is given as the first argument.
-const DEFAULT_ROOT: &str = "/mnt/frame";
+const DEFAULT_ROOT: &str = "/mnt/photos";
 
 // Linux key codes. The buttons are set up in /boot/firmware/config.txt to act
 // as these keys, so a USB keyboard works too (handy for testing).
