@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -10,6 +11,8 @@ use crate::indexer;
 
 pub struct Photo {
     pub path: PathBuf,
+    /// Name of the group folder the photo is in, if any.
+    pub group: Option<String>,
     /// (year, month, day) the photo was taken, if the camera recorded it.
     pub date: Option<(u16, u8, u8)>,
     /// EXIF orientation, 1-8 (1 = already upright).
@@ -70,9 +73,14 @@ impl Mode {
 
 // A map of the file system into the appropriate categories
 struct FSMapInner {
-    /// USB root that holds the IMAGES and FAVORITES folders.
+    /// USB root that holds the IMAGES folder and FAVORITES_FILE.
     root: PathBuf,
     photos: Vec<PathBuf>,
+    /// Group of each photo, matching `photos`.
+    groups: Vec<Option<String>>,
+    /// Everything in FAVORITES_FILE, as paths relative to IMAGES. Kept even
+    /// for photos not (yet) found, so saving never drops a favorite.
+    favorite_names: BTreeSet<String>,
     // These map back into self.photos and are kept sorted, so "next" in any
     // mode follows the same (shuffled) order as All Photos.
     spring: Vec<usize>,
@@ -87,6 +95,7 @@ struct FSMapInner {
 impl FSMapInner {
     fn push_photo(&mut self, photo: &Photo) -> usize {
         self.photos.push(photo.path.clone());
+        self.groups.push(photo.group.clone());
         let new_index = self.photos.len() - 1;
 
         // Update Season Buffers
@@ -114,6 +123,13 @@ impl FSMapInner {
             Mode::Winter => Some(&self.winter),
             Mode::Favorites => Some(&self.favorites),
         }
+    }
+
+    /// How `path` is written in FAVORITES_FILE: relative to IMAGES, with `/`.
+    fn key(&self, path: &Path) -> String {
+        let rel = path.strip_prefix(self.root.join(indexer::IMAGES)).unwrap_or(path);
+        let parts: Vec<_> = rel.iter().map(|p| p.to_string_lossy()).collect();
+        parts.join("/")
     }
 
     fn next_index(&self, cur: usize, mode: Mode) -> Option<usize> {
@@ -147,6 +163,8 @@ impl FSMap {
             inner: Mutex::new(FSMapInner {
                 root: root.to_path_buf(),
                 photos: Vec::new(),
+                groups: Vec::new(),
+                favorite_names: load_favorites(root),
                 spring: Vec::new(),
                 summer: Vec::new(),
                 autumn: Vec::new(),
@@ -169,6 +187,7 @@ impl FSMap {
         let mut guard = self.lock();
         let fs = &mut *guard;
         fs.photos.reserve(len);
+        fs.groups.reserve(len);
         for list in [
             &mut fs.spring,
             &mut fs.summer,
@@ -219,6 +238,32 @@ impl FSMap {
         self.lock().photos.get(img).cloned()
     }
 
+    /// Group of photo `img`, if it has one.
+    pub fn get_group(&self, img: usize) -> Option<String> {
+        self.lock().groups.get(img).cloned().flatten()
+    }
+
+    /// Whether FAVORITES_FILE lists the photo at `path`.
+    pub fn is_listed_favorite(&self, path: &Path) -> bool {
+        let fs = self.lock();
+        fs.favorite_names.contains(&fs.key(path))
+    }
+
+    /// Add these photos to FAVORITES_FILE (used before they are indexed).
+    pub fn add_listed_favorites(&self, paths: &[PathBuf]) {
+        let (root, names) = {
+            let mut fs = self.lock();
+            for path in paths {
+                let key = fs.key(path);
+                fs.favorite_names.insert(key);
+            }
+            (fs.root.clone(), fs.favorite_names.clone())
+        };
+        if let Err(e) = save_favorites(&root, &names) {
+            println!("[FSMap] Can't save favorites: {e}");
+        }
+    }
+
     pub fn is_favorite(&self, img: usize) -> bool {
         self.lock().favorites.binary_search(&img).is_ok()
     }
@@ -247,43 +292,33 @@ impl FSMap {
             .unwrap_or_default()
     }
 
-    /// Move photo `img` between IMAGES and FAVORITES on the stick and update
-    /// the favorites list. Returns whether the photo is a favorite afterwards,
-    /// so if the move fails (bad index, name clash, stick pulled) it returns
-    /// the unchanged state.
+    /// Add photo `img` to FAVORITES_FILE, or take it off, and save the file
+    /// to the stick. Returns whether the photo is a favorite afterwards, so
+    /// if saving fails (bad index, stick pulled) it returns the unchanged
+    /// state.
     pub fn toggle_favorite(&self, img: usize) -> bool {
-        // Don't hold the lock while touching the stick, so the indexer can
-        // keep adding photos meanwhile.
-        let (path, was_favorite, root) = {
+        let (root, mut names, key, was_favorite) = {
             let fs = self.lock();
             let Some(path) = fs.photos.get(img) else {
                 return false;
             };
             let was_favorite = fs.favorites.binary_search(&img).is_ok();
-            (path.clone(), was_favorite, fs.root.clone())
+            (fs.root.clone(), fs.favorite_names.clone(), fs.key(path), was_favorite)
         };
-        let Some(name) = path.file_name() else {
-            return was_favorite;
-        };
-        let folder = root.join(if was_favorite {
-            indexer::IMAGES
+        if was_favorite {
+            names.remove(&key);
         } else {
-            indexer::FAVORITES
-        });
-        let dest = folder.join(name);
-        // Never overwrite a different photo that happens to share the name.
-        if dest.exists() {
+            names.insert(key);
+        }
+        // Don't hold the lock while touching the stick, so the indexer can
+        // keep adding photos meanwhile.
+        if let Err(e) = save_favorites(&root, &names) {
+            println!("[FSMap] Can't save favorites: {e}");
             return was_favorite;
         }
-        let _ = fs::create_dir_all(&folder);
-        if fs::rename(&path, &dest).is_err() {
-            return was_favorite;
-        }
-        // Flush to the stick now so pulling the plug can't lose the move.
-        let _ = Command::new("sync").status();
 
         let mut fs = self.lock();
-        fs.photos[img] = dest;
+        fs.favorite_names = names;
         match fs.favorites.binary_search(&img) {
             Ok(at) => {
                 fs.favorites.remove(at);
@@ -292,6 +327,37 @@ impl FSMap {
         }
         !was_favorite
     }
+}
+
+/// Read FAVORITES_FILE: one photo per line, `#` lines are comments.
+fn load_favorites(root: &Path) -> BTreeSet<String> {
+    let text = fs::read_to_string(root.join(indexer::FAVORITES_FILE)).unwrap_or_default();
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
+/// Write FAVORITES_FILE so that pulling the plug at any moment leaves either
+/// the old list or the new one: write a copy, flush it, then swap it in.
+fn save_favorites(root: &Path, names: &BTreeSet<String>) -> std::io::Result<()> {
+    let mut text = String::from(
+        "# Favorite photos, one per line, written by the photo frame.\n\
+         # Paths are inside the photos folder, e.g. Beach Trip/IMG_0001.jpg\n",
+    );
+    for name in names {
+        text += name;
+        text.push('\n');
+    }
+    let path = root.join(indexer::FAVORITES_FILE);
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, text)?;
+    fs::File::open(&tmp)?.sync_all()?;
+    fs::rename(&tmp, &path)?;
+    // Flush the rename to the stick too.
+    let _ = Command::new("sync").status();
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -344,6 +410,7 @@ mod tests {
     fn photo(name: &str, month: Option<u8>, favorite: bool) -> Photo {
         Photo {
             path: PathBuf::from(name),
+            group: None,
             date: month.map(|m| (2024, m, 1)),
             orientation: 1,
             favorite,
@@ -390,25 +457,31 @@ mod tests {
     }
 
     #[test]
-    fn toggle_moves_file_and_updates_favorites() {
+    fn toggle_saves_favorites_file() {
         let root = std::env::temp_dir().join(format!("fsmap-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join(indexer::IMAGES)).unwrap();
-        let file = root.join(indexer::IMAGES).join("x.jpg");
+        fs::create_dir_all(root.join(indexer::IMAGES).join("Trip")).unwrap();
+        // A favorite whose photo isn't on the stick must survive a save.
+        fs::write(root.join(indexer::FAVORITES_FILE), "# comment\nGone.jpg\n").unwrap();
+        let file = root.join(indexer::IMAGES).join("Trip").join("x.jpg");
         fs::write(&file, b"not really a jpeg").unwrap();
 
         let mut p = photo("x.jpg", Some(6), false);
         p.path = file.clone();
+        p.group = Some("Trip".into());
         let map = map_of(&root, &[p]);
+        assert!(!map.is_listed_favorite(&file));
+        assert_eq!(map.get_group(0).as_deref(), Some("Trip"));
 
+        let listed = || load_favorites(&root).into_iter().collect::<Vec<_>>();
         assert!(map.toggle_favorite(0));
-        let fav = root.join(indexer::FAVORITES).join("x.jpg");
-        assert!(fav.exists() && !file.exists());
-        assert_eq!(map.get_photo(0), Some(fav.clone()));
-        assert_eq!(map.get_next(0, Mode::Favorites), fav);
+        assert!(file.exists(), "photo must not move");
+        assert_eq!(listed(), ["Gone.jpg", "Trip/x.jpg"]);
+        assert_eq!(map.get_next(0, Mode::Favorites), file);
+        assert!(FSMap::new(&root).is_listed_favorite(&file));
 
         assert!(!map.toggle_favorite(0));
-        assert!(file.exists() && !fav.exists());
+        assert_eq!(listed(), ["Gone.jpg"]);
         assert_eq!(map.get_next_index(0, Mode::Favorites), None);
 
         // Bad index: nothing happens.

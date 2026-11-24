@@ -14,8 +14,10 @@ one at a time, with the date each was taken in the bottom-left corner.
 - It draws straight to the Linux framebuffer and then sleeps. Between slides it uses no CPU at all; it wakes once every 30 seconds or when a button is pressed.
 - **Mode button** cycles All Photos -> Spring -> Summer -> Autumn -> Winter ->
   Favorites. The mode name shows in the top-left corner when it changes.
-- **Favorite button** moves the photo on screen between `Images/` and
-  `Favorites/` on the stick. Favorites have a `*` after the date.
+- **Favorite button** adds the photo on screen to `favorites.txt` on the
+  stick, or takes it off. Favorites have a `*` after the date.
+- **Groups**: each folder inside `photos/` is a group, and its name shows
+  above the date.
 
 It has been tested against a simulated framebuffer and button device, not yet
 on a real Pi, so expect to spend a little time on first boot.
@@ -45,7 +47,10 @@ Things to know:
   and skipped; the slideshow carries on with the rest.
 - Seasons go by month (Mar-May, Jun-Aug, Sep-Nov, Dec-Feb). Photos with no
   "date taken" appear only in All Photos and Favorites, with no caption.
-- Only the top level of `Images/` and `Favorites/` is read, not subfolders.
+- Photos are read from `photos/` and from each group folder directly inside
+  it. Folders inside a group are skipped (and logged).
+- Group names show in a simple bitmap font: English and Western European
+  letters (é, ñ, ü...) work; other characters show as `?`.
 - The slide time is `SLIDE` at the top of `src/presenter.rs`.
 
 ## Testing without a screen
@@ -56,7 +61,7 @@ folder explains each one:
 
 | Setting       | Default        | What it does                                              |
 | ------------- | -------------- | --------------------------------------------------------- |
-| `photos_root` | `/mnt/photos`  | Folder holding `photos/` and `favorites/`                 |
+| `photos_root` | `/mnt/photos`  | Folder holding `photos/` and `favorites.txt`              |
 | `fb_file`     | (none)         | Write each frame to this file while `/dev/fb0` is missing |
 | `fb_size`     | `1920x1080`    | Size of the frames written to `fb_file`                   |
 | `brightness`  | `100`          | Dims the picture, 1-100 percent (software only)           |
@@ -120,12 +125,35 @@ Format it as **exFAT** (or FAT32) and name it **`FRAME`**. Lay it out as:
 
 ```
 Instructions.txt
-Images/       <- put photos here
-Favorites/    <- the frame moves favorites here
+favorites.txt          <- the frame keeps the list of favorites here
+photos/                <- put photos here...
+  IMG_0001.jpg            (no group)
+  Beach Trip/          <- ...or in a folder: the folder name is the group
+    IMG_0002.jpg
 ```
 
 To add photos: unplug the frame, put the stick in a computer, copy JPEGs into
-`Images/`, put it back, plug the frame in.
+`photos/` or a group folder inside it, put it back, plug the frame in. A
+group can't have folders inside it.
+
+To sort photos into groups without dragging files around, run:
+
+```
+tools/.venv/bin/python tools/photo-group.py /Volumes/FRAME
+```
+
+It opens a page in your browser that shows each ungrouped photo and its date,
+with your groups on the right. Click a group (or press its number) to move
+the photo there, **No group** (N) to leave it, **+ New group** to make one,
+and U to undo. Photos you leave are remembered, so the next run carries on
+where you stopped. `--all` goes through grouped photos too, and `--restart`
+shows the ones you left again. Favorites stay favorites when they move.
+
+`favorites.txt` lists one photo per line, as its path inside `photos/` (for
+example `Beach Trip/IMG_0002.jpg`). You can edit it by hand. If you rename a
+photo or move it to another group, it stops being a favorite. A stick from
+an older version, with a `favorites/` folder, is converted at start-up: its
+photos are moved into `photos/` and listed in `favorites.txt`.
 
 ## Parts
 
@@ -241,7 +269,7 @@ partition read-only when asked. The SD card is then never written to, so
 pulling the power cannot corrupt it. (Turn it off again the same way if you
 need to change something.)
 
-The USB stick stays writable for favorites. Each move is flushed to the stick
+The USB stick stays writable for favorites. Each change is flushed to the stick
 right away.
 
 ## Using less power
@@ -260,7 +288,7 @@ access. A longer `SLIDE` time means fewer wake-ups.
 
 ## If something is wrong
 
-- **"No photos found"**: the stick is not named `FRAME`, has no `Images/`
+- **"No photos found"**: the stick is not named `FRAME`, has no `photos/`
   folder, or holds no JPEGs. The stick is only read at start-up, so fix it,
   then unplug the frame and plug it back in.
 - **A photo never shows up**: it couldn't be read and was skipped.

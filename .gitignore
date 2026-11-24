@@ -2,3 +2,4 @@
 tools/.venv
 tools/.photo-review-kept.txt
 tools/__pycache__
+tools/.photo-group-skipped.txt

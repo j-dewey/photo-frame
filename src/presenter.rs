@@ -104,6 +104,7 @@ impl Presenter {
         let (date, orientation) = read_exif(&path);
         Photo {
             path,
+            group: self.map.get_group(i),
             date,
             orientation,
             favorite: self.map.is_favorite(i),
@@ -135,7 +136,8 @@ impl Presenter {
         };
     }
 
-    /// Photo + date caption (bottom left) + optional message (top left).
+    /// Photo + caption (bottom left: group name over the date) + optional
+    /// message (top left).
     fn draw(&mut self, message: Option<&str>) -> Res<()> {
         if self.fb.reconnect() {
             // A screen appeared at a different size: redo the photo for it.
@@ -154,8 +156,15 @@ impl Presenter {
             if photo.favorite {
                 caption += if caption.is_empty() { "*" } else { " *" };
             }
-            let y = h.saturating_sub(margin + scale * 12);
-            text(&mut frame, w, h, &caption, margin, y, scale);
+            // Bottom line first, then the group name above it.
+            let line_h = scale * 12;
+            let mut y = h.saturating_sub(margin + line_h);
+            for line in [Some(caption.as_str()), photo.group.as_deref()].into_iter().flatten() {
+                if !line.is_empty() {
+                    text(&mut frame, w, h, line, margin, y, scale);
+                    y = y.saturating_sub(line_h + scale * 2);
+                }
+            }
         }
         if let Some(message) = message {
             text(&mut frame, w, h, message, margin, margin, scale);
@@ -304,13 +313,60 @@ fn blur(img: &mut [u8], w: usize, h: usize, r: usize) {
     }
 }
 
+/// Join a letter and a separate accent mark after it (macOS writes "é" in
+/// file names as "e" + "´") into the single letter the font has.
+fn compose(s: &str) -> impl Iterator<Item = char> + '_ {
+    // For each mark: pairs of (plain letter, accented letter).
+    const TABLE: [(char, &str); 7] = [
+        ('\u{300}', "AÀEÈIÌOÒUÙaàeèiìoòuù"),
+        ('\u{301}', "AÁEÉIÍOÓUÚYÝaáeéiíoóuúyý"),
+        ('\u{302}', "AÂEÊIÎOÔUÛaâeêiîoôuû"),
+        ('\u{303}', "AÃNÑOÕaãnñoõ"),
+        ('\u{308}', "AÄEËIÏOÖUÜaäeëiïoöuüyÿ"),
+        ('\u{30A}', "AÅaå"),
+        ('\u{327}', "CÇcç"),
+    ];
+    let mut chars = s.chars().peekable();
+    std::iter::from_fn(move || {
+        let ch = chars.next()?;
+        let Some(&mark) = chars.peek() else {
+            return Some(ch); // last character
+        };
+        let Some((_, pairs)) = TABLE.iter().find(|(m, _)| *m == mark) else {
+            return Some(ch);
+        };
+        let pairs: Vec<char> = pairs.chars().collect();
+        match pairs.chunks(2).find(|p| p[0] == ch) {
+            Some(p) => {
+                chars.next();
+                Some(p[1])
+            }
+            None => Some(ch),
+        }
+    })
+}
+
+/// The 8x8 bitmap for `ch`. Covers English and Western European letters
+/// (é, ñ, ü...). Accent marks the font can't join on are dropped; anything
+/// else shows as '?'.
+fn glyph(ch: char) -> Option<[u8; 8]> {
+    use font8x8::legacy::{BASIC_LEGACY, LATIN_LEGACY};
+    match ch as u32 {
+        0x0300..=0x036F => None,
+        c @ 0x20..=0x7E => Some(BASIC_LEGACY[c as usize]),
+        c @ 0xA0..=0xFF => Some(LATIN_LEGACY[c as usize - 0xA0]),
+        _ => Some(BASIC_LEGACY[b'?' as usize]),
+    }
+}
+
 /// White text on a darkened box, so it is readable over any photo.
 fn text(frame: &mut [u8], w: usize, h: usize, s: &str, x: usize, y: usize, scale: usize) {
     if s.is_empty() {
         return;
     }
+    let glyphs: Vec<[u8; 8]> = compose(s).filter_map(glyph).collect();
     let pad = scale * 2;
-    let (box_w, box_h) = (s.len() * 8 * scale + pad * 2, 8 * scale + pad * 2);
+    let (box_w, box_h) = (glyphs.len() * 8 * scale + pad * 2, 8 * scale + pad * 2);
     for py in y..(y + box_h).min(h) {
         for px in x..(x + box_w).min(w) {
             for c in 0..3 {
@@ -318,8 +374,7 @@ fn text(frame: &mut [u8], w: usize, h: usize, s: &str, x: usize, y: usize, scale
             }
         }
     }
-    for (i, ch) in s.bytes().enumerate() {
-        let glyph = font8x8::legacy::BASIC_LEGACY[(ch & 127) as usize];
+    for (i, glyph) in glyphs.iter().enumerate() {
         for (row, bits) in glyph.iter().enumerate() {
             for col in (0..8).filter(|col| bits >> col & 1 == 1) {
                 let (gx, gy) = (x + pad + (i * 8 + col) * scale, y + pad + row * scale);
@@ -330,5 +385,19 @@ fn text(frame: &mut [u8], w: usize, h: usize, s: &str, x: usize, y: usize, scale
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compose;
+
+    #[test]
+    fn joins_separate_accents() {
+        let c = |s: &str| compose(s).collect::<String>();
+        assert_eq!(c("Cafe\u{301} Trip"), "Café Trip");
+        assert_eq!(c("Cafe\u{301}"), "Café");
+        assert_eq!(c("Kamila"), "Kamila");
+        assert_eq!(c("x\u{301}"), "x\u{301}"); // no such letter: left alone
     }
 }

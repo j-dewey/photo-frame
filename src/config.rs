@@ -5,7 +5,7 @@
 //! defaults. The format is one `key = value` per line, with `#` comments:
 //!
 //! ```text
-//! photos_root = /mnt/photos      # folder holding photos/ and favorites/
+//! photos_root = /mnt/photos      # folder holding photos/ and favorites.txt
 //! fb_file = /dev/shm/fb.raw      # where frames go while /dev/fb0 is missing
 //! fb_size = 1920x1080            # size of the frames written to fb_file
 //! brightness = 70               # percent; dims the picture in software
