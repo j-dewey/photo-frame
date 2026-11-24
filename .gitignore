@@ -1,1 +1,4 @@
 /target
+tools/.venv
+tools/.photo-review-kept.txt
+tools/__pycache__

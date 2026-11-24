@@ -164,7 +164,17 @@ impl Presenter {
     }
 }
 
-/// Decode a JPEG and fit it to a w*h RGB canvas: upright, centred, black bars.
+/// Photos whose shape is close to the screen's are zoomed to fill it,
+/// losing at most this share of the picture off two opposite edges. Others
+/// are shown whole, over a blurred copy of themselves instead of black bars.
+const MAX_CROP: f32 = 0.15;
+/// The blurred background is built this many times smaller than the screen,
+/// which makes blurring it nearly free.
+const BG_SHRINK: usize = 16;
+/// Brightness of the blurred background (1.0 = as bright as the photo).
+const BG_DIM: f32 = 0.55;
+
+/// Decode a JPEG and fit it to a w*h RGB canvas, upright and centred.
 fn render(photo: &Photo, w: usize, h: usize) -> Res<Vec<u8>> {
     let mut decoder = Decoder::new(BufReader::new(File::open(&photo.path)?));
     decoder.read_info()?;
@@ -172,19 +182,22 @@ fn render(photo: &Photo, w: usize, h: usize) -> Res<Vec<u8>> {
     let o = photo.orientation;
     let sideways = (5..=8).contains(&o);
 
-    // Size of the photo on screen once turned upright and fitted.
+    // Size of the photo once turned upright.
     let (iw, ih) = match sideways {
         true => (info.height as f32, info.width as f32),
         false => (info.width as f32, info.height as f32),
     };
+    // Shown whole ("fit"), or zoomed to cover the screen ("fill").
     let fit = f32::min(w as f32 / iw, h as f32 / ih);
-    let ow = ((iw * fit) as usize).clamp(1, w);
-    let oh = ((ih * fit) as usize).clamp(1, h);
+    let cover = f32::max(w as f32 / iw, h as f32 / ih);
+    let fill = fit / cover >= 1.0 - MAX_CROP;
+    let s = if fill { cover } else { fit };
+    let (ow, oh) = ((iw * s).max(1.0), (ih * s).max(1.0));
 
     // Let the decoder shrink the photo as it decodes (by 2, 4 or 8). This is
     // the big saving: a 12-megapixel photo never gets fully decoded.
     let (want_w, want_h) = if sideways { (oh, ow) } else { (ow, oh) };
-    let (sw, sh) = decoder.scale(want_w as u16, want_h as u16)?;
+    let (sw, sh) = decoder.scale(want_w.ceil().min(65535.0) as u16, want_h.ceil().min(65535.0) as u16)?;
     let (sw, sh) = (sw as usize, sh as usize);
     let pixels = decoder.decode()?;
     let channels = match info.pixel_format {
@@ -209,26 +222,86 @@ fn render(photo: &Photo, w: usize, h: usize) -> Res<Vec<u8>> {
         pixels[(sy * sw + sx) * channels + c.min(channels - 1)] as f32
     };
 
-    // Bilinear resample into the centre of a black canvas.
     let mut canvas = vec![0u8; w * h * 3];
-    let (left, top) = ((w - ow) / 2, (h - oh) / 2);
-    for y in 0..oh {
-        let fy = ((y as f32 + 0.5) * vh as f32 / oh as f32 - 0.5).clamp(0.0, (vh - 1) as f32);
+    if !fill {
+        // Background: a tiny copy that covers the screen, blurred, dimmed,
+        // then stretched up to full size.
+        let (bw, bh) = ((w / BG_SHRINK).max(1), (h / BG_SHRINK).max(1));
+        let bs = f32::max(bw as f32 / vw as f32, bh as f32 / vh as f32);
+        let mut small = vec![0u8; bw * bh * 3];
+        place(&mut small, bw, bh, &at, vw, vh, vw as f32 * bs, vh as f32 * bs);
+        for _ in 0..3 {
+            blur(&mut small, bw, bh, 2);
+        }
+        small.iter_mut().for_each(|v| *v = (*v as f32 * BG_DIM) as u8);
+        let small_at = |x: usize, y: usize, c: usize| small[(y * bw + x) * 3 + c] as f32;
+        place(&mut canvas, w, h, small_at, bw, bh, w as f32, h as f32);
+    }
+    place(&mut canvas, w, h, &at, vw, vh, ow, oh);
+    Ok(canvas)
+}
+
+/// Bilinear-resample a vw*vh image (read through `src`) to ow*oh, centred on
+/// a w*h RGB canvas. Parts that fall off the canvas are cropped.
+#[allow(clippy::too_many_arguments)]
+fn place(
+    dst: &mut [u8],
+    w: usize,
+    h: usize,
+    src: impl Fn(usize, usize, usize) -> f32,
+    vw: usize,
+    vh: usize,
+    ow: f32,
+    oh: f32,
+) {
+    let (left, top) = ((w as f32 - ow) / 2.0, (h as f32 - oh) / 2.0);
+    let (kx, ky) = (vw as f32 / ow, vh as f32 / oh);
+    let span = |start: f32, len: f32, max: usize| {
+        (start.max(0.0).round() as usize)..((start + len).round().clamp(0.0, max as f32) as usize)
+    };
+    let xs = span(left, ow, w);
+    for y in span(top, oh, h) {
+        let fy = ((y as f32 + 0.5 - top) * ky - 0.5).clamp(0.0, (vh - 1) as f32);
         let (y0, ty) = (fy as usize, fy.fract());
         let y1 = (y0 + 1).min(vh - 1);
-        for x in 0..ow {
-            let fx = ((x as f32 + 0.5) * vw as f32 / ow as f32 - 0.5).clamp(0.0, (vw - 1) as f32);
+        for x in xs.clone() {
+            let fx = ((x as f32 + 0.5 - left) * kx - 0.5).clamp(0.0, (vw - 1) as f32);
             let (x0, tx) = (fx as usize, fx.fract());
             let x1 = (x0 + 1).min(vw - 1);
             for c in 0..3 {
-                let above = at(x0, y0, c) * (1.0 - tx) + at(x1, y0, c) * tx;
-                let below = at(x0, y1, c) * (1.0 - tx) + at(x1, y1, c) * tx;
+                let above = src(x0, y0, c) * (1.0 - tx) + src(x1, y0, c) * tx;
+                let below = src(x0, y1, c) * (1.0 - tx) + src(x1, y1, c) * tx;
                 let value = above * (1.0 - ty) + below * ty;
-                canvas[((top + y) * w + left + x) * 3 + c] = (value + 0.5) as u8;
+                dst[(y * w + x) * 3 + c] = (value + 0.5) as u8;
             }
         }
     }
-    Ok(canvas)
+}
+
+/// One box-blur pass of radius r over a w*h RGB image (edges repeat).
+fn blur(img: &mut [u8], w: usize, h: usize, r: usize) {
+    let n = (2 * r + 1) as u32;
+    let mut tmp = vec![0u8; img.len()];
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..3 {
+                let sum: u32 = (0..n as usize)
+                    .map(|i| img[(y * w + (x + i).saturating_sub(r).min(w - 1)) * 3 + c] as u32)
+                    .sum();
+                tmp[(y * w + x) * 3 + c] = (sum / n) as u8;
+            }
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..3 {
+                let sum: u32 = (0..n as usize)
+                    .map(|i| tmp[((y + i).saturating_sub(r).min(h - 1) * w + x) * 3 + c] as u32)
+                    .sum();
+                img[(y * w + x) * 3 + c] = (sum / n) as u8;
+            }
+        }
+    }
 }
 
 /// White text on a darkened box, so it is readable over any photo.

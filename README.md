@@ -35,6 +35,10 @@ Things to know:
 - **JPEG only.** `.jpg` / `.jpeg`. iPhone HEIC photos must be exported as JPEG
   first. Other files are ignored.
 - Photos play in a random order that changes every boot.
+- Photos close to the screen's shape are zoomed to fill it (losing at most
+  15% off two edges). Others, such as tall phone photos, are shown whole over
+  a blurred, darkened copy of themselves instead of black bars. Tune with
+  `MAX_CROP`, `BG_DIM` and `BG_SHRINK` in `src/presenter.rs`.
 - The slideshow starts as soon as the first photo has been read, while the
   rest of the stick is still being scanned.
 - The stick is read once at start-up. Photos that can't be read are logged
@@ -79,20 +83,27 @@ but not the buttons.
 ### Watching the Pi's screen from your computer
 
 `tools/pi-screen.py` shows the Pi's screen live in a browser tab, as if a
-monitor were plugged in. It copies the framebuffer over SSH every 2 seconds;
+monitor were plugged in. It copies the picture over SSH every 2 seconds;
 nothing needs installing on the Pi.
 
 ```
 python3 tools/pi-screen.py <user>@<name>.local
 ```
 
-With a monitor (or HDMI forced on, step 3) it reads `/dev/fb0`. With no
-screen at all, the program writes frames to `fb_file` instead
-(`/dev/shm/fb.raw` in the example `photos.conf`), so point the viewer there:
+It reads from wherever the slideshow is drawing: `/dev/fb0` when there is a
+screen (or HDMI is forced on, step 3), otherwise the `fb_file` set in the
+Pi's `/etc/photos.conf`, at its `fb_size`. It follows the slideshow when it
+switches, and the bar at the top says which one you're looking at.
 
-```
-python3 tools/pi-screen.py <user>@<name>.local --device /dev/shm/fb.raw --size 1920x1080
-```
+To pick one yourself:
+
+| Option                 | Shows                                                    |
+| ---------------------- | -------------------------------------------------------- |
+| `--source screen`      | Only `/dev/fb0`                                          |
+| `--source file`        | Only the `fb_file`, even if there is a screen            |
+| `--file PATH`          | This file instead of the config's `fb_file`              |
+| `--size WxH`           | That file's size, instead of the config's `fb_size`      |
+| `--config PATH`        | A different `photos.conf` on the Pi                      |
 
 Keep `fb_file` somewhere in RAM like `/dev/shm`: the whole file is rewritten
 every slide, which would wear out the SD card.
