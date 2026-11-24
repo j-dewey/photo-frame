@@ -38,6 +38,8 @@ pub struct Fb {
     fb_size: (usize, usize),
     pub width: usize,
     pub height: usize,
+    /// Each colour value 0-255 -> the value drawn, dimmed to `brightness`.
+    dim: [u8; 256],
 }
 
 impl Fb {
@@ -49,6 +51,7 @@ impl Fb {
             fb_size: config.fb_size,
             width: config.fb_size.0,
             height: config.fb_size.1,
+            dim: std::array::from_fn(|v| (v * config.brightness as usize / 100) as u8),
         };
         if let Err(e) = fb.connect() {
             println!("[Fb] Unable to conenct to file {:?}", fb.fb_file);
@@ -99,11 +102,12 @@ impl Fb {
         let Some(dev) = &mut self.device else {
             return Ok(());
         };
+        let dim = &self.dim;
         for y in 0..self.height {
             let row = &mut dev.buf[y * dev.stride..];
             for x in 0..self.width {
                 let p = &rgb[(y * self.width + x) * 3..];
-                let (r, g, b) = (p[0], p[1], p[2]);
+                let (r, g, b) = (dim[p[0] as usize], dim[p[1] as usize], dim[p[2] as usize]);
                 if dev.bytes_per_pixel == 4 {
                     row[x * 4..x * 4 + 4].copy_from_slice(&[b, g, r, 255]);
                 } else {

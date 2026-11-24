@@ -8,6 +8,7 @@
 //! photos_root = /mnt/photos      # folder holding photos/ and favorites/
 //! fb_file = /dev/shm/fb.raw      # where frames go while /dev/fb0 is missing
 //! fb_size = 1920x1080            # size of the frames written to fb_file
+//! brightness = 70               # percent; dims the picture in software
 //! ```
 
 use std::fs;
@@ -24,6 +25,9 @@ pub struct Config {
     /// Size of the frames written to `fb_file`, and of the drawing while
     /// headless.
     pub fb_size: (usize, usize),
+    /// How bright to draw everything, 1-100 percent. Done in software: the
+    /// screen's backlight (and its power use) stays the same.
+    pub brightness: u8,
 }
 
 impl Default for Config {
@@ -32,6 +36,7 @@ impl Default for Config {
             photos_root: PathBuf::from("/mnt/photos"),
             fb_file: None,
             fb_size: (1920, 1080),
+            brightness: 100,
         }
     }
 }
@@ -85,6 +90,15 @@ impl Config {
                     .ok_or_else(|| format!("fb_size must be WIDTHxHEIGHT, not `{value}`"))?;
                 self.fb_size = size;
             }
+            "brightness" => {
+                self.brightness = value
+                    .trim_end_matches('%')
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|b| (1..=100).contains(b))
+                    .ok_or_else(|| format!("brightness must be 1 to 100, not `{value}`"))?;
+            }
             _ => return Err(format!("unknown setting `{key}`")),
         }
         Ok(())
@@ -101,6 +115,7 @@ mod tests {
         assert_eq!(c.photos_root, PathBuf::from("/mnt/photos"));
         assert_eq!(c.fb_file, None);
         assert_eq!(c.fb_size, (1920, 1080));
+        assert_eq!(c.brightness, 100);
     }
 
     #[test]
@@ -108,11 +123,13 @@ mod tests {
         let c = Config::parse(
             "photos_root = /media/stick   # comment\n\
              fb_file=/dev/shm/fb.raw\n\
-             fb_size = 800x480\n",
+             fb_size = 800x480\n\
+             brightness = 60%\n",
         );
         assert_eq!(c.photos_root, PathBuf::from("/media/stick"));
         assert_eq!(c.fb_file, Some(PathBuf::from("/dev/shm/fb.raw")));
         assert_eq!(c.fb_size, (800, 480));
+        assert_eq!(c.brightness, 60);
     }
 
     #[test]
@@ -122,10 +139,13 @@ mod tests {
              colour = blue\n\
              just some words\n\
              fb_file =\n\
+             brightness = 0\n\
+             brightness = 150\n\
              photos_root = /ok\n",
         );
         assert_eq!(c.fb_size, (1920, 1080));
         assert_eq!(c.fb_file, None);
+        assert_eq!(c.brightness, 100);
         assert_eq!(c.photos_root, PathBuf::from("/ok"));
     }
 

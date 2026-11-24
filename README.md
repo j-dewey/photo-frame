@@ -59,6 +59,7 @@ folder explains each one:
 | `photos_root` | `/mnt/photos`  | Folder holding `photos/` and `favorites/`                 |
 | `fb_file`     | (none)         | Write each frame to this file while `/dev/fb0` is missing |
 | `fb_size`     | `1920x1080`    | Size of the frames written to `fb_file`                   |
+| `brightness`  | `100`          | Dims the picture, 1-100 percent (software only)           |
 
 If `/dev/fb0` appears later (a screen is plugged in), the program switches to
 it at the next slide and stops writing the file. A missing `photos.conf`
